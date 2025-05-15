@@ -1,0 +1,160 @@
+function result = MPC_func(hp, reference, route)
+%MPC_FUNC Summary of this function goes here
+%   Detailed explanation goes here
+
+% hyperparameters
+N = hp.N;
+Ts = hp.Ts;
+
+x_low = hp.xl; x_up = hp.xu;
+u_low(1) = -max(abs(diff(reference.sog)))/Ts; u_up(1) = max(abs(diff(reference.sog)))/Ts; 
+u_low(2) = -max(abs(diff(reference.heading)))/Ts; u_up(2) = max(abs(diff(reference.heading)))/Ts;
+
+qx = hp.qx; qy = hp.qy; qv = hp.qv; qpsi = hp.qpsi; qomega = hp.qomega;
+
+r1 = hp.r1; r2 = hp.r2;
+
+
+t1 = N;
+t2 = size(route.utmX,1);
+
+tt = t1:1:t2;
+%tt = 128;
+% control loop
+
+% per parfor
+
+x_res = zeros(t2,1);
+y_res = zeros(t2,1);
+v_res = zeros(t2,1);
+psi_res = zeros(t2,1);
+
+J_res = zeros(t2,1);
+
+u1_res = zeros(t2,1);
+u2_res = zeros(t2,1);
+parfor t = tt
+
+    disp(t)
+    % optimization problem
+
+    % objective function
+
+    % compute rif
+    [~,idx] = min((reference.utmX - route.utmX(t)).^2 + (reference.utmY - route.utmY(t)).^2);
+    if idx+N > length(reference.utmX) || t+N > length(route.utmX)
+        J_res(t) = 0;
+    else
+
+    % state variables
+    x = sdpvar(N+1,1);
+    y = sdpvar(N+1,1);
+    v = sdpvar(N+1,1);
+    psi = sdpvar(N+1,1);
+
+
+    % input variables
+    u1 = sdpvar(N,1);
+    u2 = sdpvar(N,1);
+
+
+    % CONSTRAINTS
+
+    xl4 = route.heading(t:t+N) - pi;
+    xu4 = route.heading(t:t+N) + pi;
+
+
+    % initial state constraints
+    constraints = [...
+    x(1) == route.utmX(t); ...
+    y(1) == route.utmY(t); ... 
+    v(1) == route.sog(t); ...
+    psi(1) == route.heading(t); ...
+
+    % state evolution constraints
+    x(2:N+1) == x(1:N) + Ts*v(1:N).*sin(psi(1:N)); ...
+    y(2:N+1) == y(1:N) + Ts*v(1:N).*cos(psi(1:N)); ...
+    v(2:N+1) == v(1:N) + Ts*u1; ...
+    %psi(2:N+1) == psi(1:N) + Ts*omega(1:N) - floor((psi(1:N) + Ts*omega(1:N))/(2*pi))*2*pi; ...
+    % psi(2:N+1) == mod(psi(1:N) + Ts*omega(1:N), 2*pi); ...
+    psi(2:N+1) == psi(1:N) + u2*Ts; ...
+
+    % input boundaries
+    u1 <= u_up(1); ...
+    u2 <= u_up(2); ...
+    u_low(1) <= u1; ...
+    u_low(2) <= u2; ...
+
+    % state boundaries
+    x <= x_up(1); ...
+    y <= x_up(2); ...
+    v <= x_up(3); ...
+    psi <= xu4; ...
+    x_low(1) <= x; ...
+    x_low(2) <= y; ...
+    x_low(3) <= v; ...
+    xl4 <= psi; ...
+    ];
+
+    rif = [reference.utmX(idx:idx+N) reference.utmY(idx:idx+N) reference.sog(idx:idx+N) reference.heading(idx:idx+N) reference.rot(idx:idx+N)];
+
+    % assign starting point to the solver
+    assign(v, route.sog(t:t+N));
+    assign(u1, (route.sog(t+1:t+N)-route.sog(t:t+N-1))/Ts);
+
+    assign(psi, route.heading(t:t+N));
+    assign(u2, (route.heading(t+1:t+N) - route.heading(t:t+N-1))/Ts);
+
+    assign(x(1), route.utmX(t));
+    assign(y(1), route.utmY(t));
+    assign(x(2:N+1), route.utmX(t:t+N-1) + Ts*route.sog(t:t+N-1).*sin(route.heading(t:t+N-1)));
+    assign(y(2:N+1), route.utmY(t:t+N-1) + Ts*route.sog(t:t+N-1).*cos(route.heading(t:t+N-1)));
+
+    % function declaration
+    obj =  ...
+        qx*((x - rif(:,1))'*(x - rif(:,1))) + ...
+        qy*((y - rif(:,2))'*(y - rif(:,2))) + ...
+        qv*((v - rif(:,3))'*(v - rif(:,3))) + ...
+        qpsi*((psi - rif(:,4))'*(psi - rif(:,4))) + ...
+        r1*(u1'*u1) + ...
+        r2*(u2'*u2) ...
+        ;
+
+    % solution 
+    ops = sdpsettings('solver', 'ipopt', 'verbose',1,'debug',1, 'usex0',1);
+    ops.ipopt.max_iter = 5000;
+    s = optimize(constraints, obj, ops);
+    
+
+    % save results
+    x_res(t) = value(x(2)); 
+    y_res(t) = value(y(2)); 
+    v_res(t) = value(v(2));
+    psi_res(t) = value(psi(2));
+
+    u1_res(t) = value(u1(1));
+    u2_res(t) = value(u2(1));
+
+    J_res(t) = sum(abs(value(psi(1:N)) - route.heading(t:t+N-1)));
+    % J_res(t) = sum((value(x(1:end)) - route.utmX(t:t+N)).^2) + sum((value(y(1:end)) - route.utmY(t:t+N)).^2);
+    close all
+    figure
+    scatter(value(x),value(y))
+    hold on
+    scatter(route.utmX(t:t+N), route.utmY(t:t+N))
+    scatter(rif(:,1),rif(:,2))
+    disp("") 
+    end
+end
+
+result.x_pred = x_res;
+result.y_pred = y_res;
+result.v_pred = v_res;
+result.psi_pred = psi_res;
+
+result.r1 = u1_res;
+result.r2 = u2_res;
+
+result.J = J_res;
+end
+
